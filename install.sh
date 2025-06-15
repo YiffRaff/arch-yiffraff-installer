@@ -1,11 +1,9 @@
 #!/bin/bash
 #
-# Arch Linux Dual-Boot Installer with Caelestia Shell
+# Arch Linux First Dual-Boot Installer with Caelestia Shell
+# This version installs Arch Linux first, then allows Windows installation later
 # WARNING: This script modifies disk partitions. Use at your own risk!
 # Always backup important data before running.
-#
-# Quick install command:
-# curl -fsSL https://raw.githubusercontent.com/your-repo/arch-caelestia-installer/main/install.sh | bash
 #
 
 set -e  # Exit on any error
@@ -50,15 +48,19 @@ if ! grep -q "archiso" /proc/cmdline 2>/dev/null; then
     fi
 fi
 
-echo -e "${BLUE}================================${NC}"
-echo -e "${BLUE} Arch Linux Dual-Boot Installer${NC}"
-echo -e "${BLUE}================================${NC}"
+echo -e "${BLUE}========================================${NC}"
+echo -e "${BLUE} Arch Linux First Dual-Boot Installer${NC}"
+echo -e "${BLUE}========================================${NC}"
 echo
-echo "This script will help you install Arch Linux alongside Windows"
-echo "with Hyprland desktop environment and rEFInd boot manager."
+echo "This script will install Arch Linux first, leaving space for Windows later."
+echo "It will:"
+echo "• Create a proper EFI partition"
+echo "• Install Arch Linux with Hyprland + Caelestia Shell"
+echo "• Reserve space for Windows installation"
+echo "• Set up GRUB to detect Windows when you install it later"
 echo
-warn "IMPORTANT: This will modify your disk partitions!"
-warn "Make sure you have backups of important data."
+warn "IMPORTANT: This will erase the selected disk completely!"
+warn "Make sure you have backups of any important data."
 echo
 
 if ! confirm "Do you want to continue?"; then
@@ -80,7 +82,7 @@ for i in "${!DISKS[@]}"; do
 done
 echo
 
-read -p "Select the disk to install Arch Linux on (1-${#DISKS[@]}): " DISK_CHOICE
+read -p "Select the disk to install on (1-${#DISKS[@]}): " DISK_CHOICE
 SELECTED_DISK="${DISKS[$((DISK_CHOICE-1))]}"
 
 if [[ -z "$SELECTED_DISK" ]]; then
@@ -88,35 +90,26 @@ if [[ -z "$SELECTED_DISK" ]]; then
 fi
 
 log "Selected disk: $SELECTED_DISK"
+DISK_SIZE=$(lsblk -dpno SIZE "$SELECTED_DISK" | tr -d ' ')
 
-# Check for existing EFI partition
-EFI_PART=""
-EXISTING_PARTS=($(lsblk -pno NAME "$SELECTED_DISK" | tail -n +2))
-
-for part in "${EXISTING_PARTS[@]}"; do
-    if [[ $(lsblk -no FSTYPE "$part" 2>/dev/null) == "vfat" ]] && [[ $(lsblk -no SIZE "$part" | grep -E "[0-9]+M|[0-9]G") ]]; then
-        # Check if it's an EFI partition
-        mkdir -p /tmp/efi_check
-        if mount "$part" /tmp/efi_check 2>/dev/null; then
-            if [[ -d "/tmp/efi_check/EFI" ]]; then
-                EFI_PART="$part"
-                log "Found existing EFI partition: $EFI_PART"
-            fi
-            umount /tmp/efi_check
-        fi
-        rmdir /tmp/efi_check 2>/dev/null || true
-    fi
-done
-
-if [[ -z "$EFI_PART" ]]; then
-    error "No EFI partition found. This script requires an existing EFI system."
+warn "This will COMPLETELY ERASE $SELECTED_DISK ($DISK_SIZE)"
+if ! confirm "Are you absolutely sure?"; then
+    exit 1
 fi
 
 # Step 2: Get installation parameters
 echo
 log "Configuration setup..."
 
-read -p "Enter desired Linux partition size (e.g., 50G, 100G): " LINUX_SIZE
+echo "Partition size recommendations for dual boot:"
+echo "• EFI: 512MB (will be created automatically)"
+echo "• Linux Root: 40-80GB (for OS and programs)"
+echo "• Linux Home: 20-40GB (for your files)"
+echo "• Windows: Rest of disk (will be left as free space)"
+echo
+
+read -p "Enter Linux root partition size (e.g., 60G): " ROOT_SIZE
+read -p "Enter Linux home partition size (e.g., 30G): " HOME_SIZE
 read -p "Enter hostname: " HOSTNAME
 read -p "Enter username: " USERNAME
 read -s -p "Enter password for $USERNAME: " USER_PASSWORD
@@ -126,60 +119,85 @@ echo
 echo
 
 # Validate inputs
-if [[ -z "$LINUX_SIZE" || -z "$HOSTNAME" || -z "$USERNAME" || -z "$USER_PASSWORD" || -z "$ROOT_PASSWORD" ]]; then
+if [[ -z "$ROOT_SIZE" || -z "$HOME_SIZE" || -z "$HOSTNAME" || -z "$USERNAME" || -z "$USER_PASSWORD" || -z "$ROOT_PASSWORD" ]]; then
     error "All fields are required"
 fi
 
-# Step 3: Create partitions
-log "Creating partitions..."
-warn "This will create new partitions on $SELECTED_DISK"
-if ! confirm "Continue with partitioning?"; then
-    exit 1
+# Step 3: Create partition table and partitions
+log "Creating partition table and partitions..."
+warn "Erasing disk and creating new partition table..."
+
+# Unmount any existing partitions
+sudo umount ${SELECTED_DISK}* 2>/dev/null || true
+
+# Create GPT partition table
+sudo parted -s "$SELECTED_DISK" mklabel gpt
+
+# Create partitions
+log "Creating EFI partition (512MB)..."
+sudo parted -s "$SELECTED_DISK" mkpart "EFI" fat32 1MiB 513MiB
+sudo parted -s "$SELECTED_DISK" set 1 esp on
+
+log "Creating Linux root partition ($ROOT_SIZE)..."
+sudo parted -s "$SELECTED_DISK" mkpart "Linux-Root" ext4 513MiB $((513 + ${ROOT_SIZE%G} * 1024))MiB
+
+log "Creating Linux home partition ($HOME_SIZE)..."
+START_HOME=$((513 + ${ROOT_SIZE%G} * 1024))
+END_HOME=$((START_HOME + ${HOME_SIZE%G} * 1024))
+sudo parted -s "$SELECTED_DISK" mkpart "Linux-Home" ext4 ${START_HOME}MiB ${END_HOME}MiB
+
+log "Creating swap partition (4GB)..."
+sudo parted -s "$SELECTED_DISK" mkpart "Linux-Swap" linux-swap ${END_HOME}MiB $((END_HOME + 4096))MiB
+
+log "The rest of the disk is left free for Windows installation later"
+
+# Wait for kernel to recognize partitions
+sleep 2
+sudo partprobe "$SELECTED_DISK"
+sleep 2
+
+# Determine partition naming scheme
+if [[ "$SELECTED_DISK" == *"nvme"* ]]; then
+    EFI_PART="${SELECTED_DISK}p1"
+    ROOT_PART="${SELECTED_DISK}p2"
+    HOME_PART="${SELECTED_DISK}p3"
+    SWAP_PART="${SELECTED_DISK}p4"
+else
+    EFI_PART="${SELECTED_DISK}1"
+    ROOT_PART="${SELECTED_DISK}2"
+    HOME_PART="${SELECTED_DISK}3"
+    SWAP_PART="${SELECTED_DISK}4"
 fi
 
-# Find free space and create partitions
-sudo fdisk "$SELECTED_DISK" <<EOF
-n
-p
-
-
-+${LINUX_SIZE}
-n
-p
-
-
-
-t
-$(sudo fdisk -l "$SELECTED_DISK" | grep "^$SELECTED_DISK" | tail -2 | head -1 | awk '{print $1}' | sed 's/.*[^0-9]//')
-83
-t
-$(sudo fdisk -l "$SELECTED_DISK" | grep "^$SELECTED_DISK" | tail -1 | awk '{print $1}' | sed 's/.*[^0-9]//')
-82
-w
-EOF
-
-# Get the new partition names
-ROOT_PART="${SELECTED_DISK}$(($(lsblk -no NAME "$SELECTED_DISK" | wc -l) - 1))"
-SWAP_PART="${SELECTED_DISK}$(lsblk -no NAME "$SELECTED_DISK" | wc -l)"
-
-log "Root partition: $ROOT_PART"
-log "Swap partition: $SWAP_PART"
+log "Partition layout:"
+echo "  EFI:  $EFI_PART (512MB)"
+echo "  Root: $ROOT_PART ($ROOT_SIZE)"
+echo "  Home: $HOME_PART ($HOME_SIZE)"
+echo "  Swap: $SWAP_PART (4GB)"
+echo "  Free space reserved for Windows"
 
 # Step 4: Format partitions
 log "Formatting partitions..."
+sudo mkfs.fat -F32 "$EFI_PART"
 sudo mkfs.ext4 -F "$ROOT_PART"
+sudo mkfs.ext4 -F "$HOME_PART"
 sudo mkswap "$SWAP_PART"
-sudo swapon "$SWAP_PART"
 
 # Step 5: Mount partitions
 log "Mounting partitions..."
+sudo swapon "$SWAP_PART"
 sudo mount "$ROOT_PART" /mnt
-sudo mkdir -p /mnt/boot
-sudo mount "$EFI_PART" /mnt/boot
+sudo mkdir -p /mnt/boot/efi
+sudo mkdir -p /mnt/home
+sudo mount "$EFI_PART" /mnt/boot/efi
+sudo mount "$HOME_PART" /mnt/home
 
 # Step 6: Install base system
+log "Updating package database..."
+sudo pacman -Sy
+
 log "Installing base system..."
-sudo pacstrap /mnt base base-devel linux linux-firmware networkmanager grub efibootmgr os-prober
+sudo pacstrap /mnt base base-devel linux linux-firmware networkmanager grub efibootmgr os-prober ntfs-3g
 
 # Step 7: Generate fstab
 log "Generating fstab..."
@@ -191,7 +209,7 @@ sudo tee /mnt/setup_system.sh > /dev/null <<CHROOT_SCRIPT
 #!/bin/bash
 set -e
 
-# Set timezone
+# Set timezone (you can change this)
 ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime
 hwclock --systohc
 
@@ -221,13 +239,18 @@ echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
 # Enable NetworkManager
 systemctl enable NetworkManager
 
-# Install and configure GRUB
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=ARCH
-sed -i 's/#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
+# Configure GRUB for dual boot
+echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
+echo "GRUB_TIMEOUT=10" >> /etc/default/grub
+
+# Install GRUB
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ARCH --recheck
+
+# Generate GRUB config
 grub-mkconfig -o /boot/grub/grub.cfg
 
 # Install additional packages
-pacman -S --noconfirm git vim wget curl
+pacman -S --noconfirm git vim wget curl firefox
 
 echo "Base system configuration completed!"
 CHROOT_SCRIPT
@@ -237,52 +260,39 @@ log "Configuring system in chroot..."
 sudo arch-chroot /mnt bash /setup_system.sh
 sudo rm /mnt/setup_system.sh
 
-# Step 10: Install Hyprland with Caelestia Shell (Quickshell)
+# Step 10: Install Hyprland with Caelestia Shell
 log "Installing Hyprland with Caelestia Shell desktop environment..."
 sudo tee /mnt/install_hyprland.sh > /dev/null <<HYPRLAND_SCRIPT
 #!/bin/bash
 set -e
 
+# Add multilib repository for some packages
+echo "" >> /etc/pacman.conf
+echo "[multilib]" >> /etc/pacman.conf
+echo "Include = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
+
+# Update package database
+pacman -Sy
+
 # Install Hyprland and essential packages
-pacman -S --noconfirm hyprland xdg-desktop-portal-hyprland kitty thunar firefox \
+pacman -S --noconfirm hyprland xdg-desktop-portal-hyprland kitty thunar \
     pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber \
     brightnessctl playerctl pamixer grim slurp wl-clipboard \
     ttf-font-awesome ttf-jetbrains-mono noto-fonts noto-fonts-emoji \
-    polkit-kde-agent qt5-wayland qt6-wayland qt6-declarative \
-    sddm git cmake make gcc pkgconf \
-    rofi-wayland swww dunst
-
-# Install Quickshell from AUR (we'll build it)
-cd /tmp
-git clone https://aur.archlinux.org/quickshell.git
-cd quickshell
-sudo -u $USERNAME makepkg -si --noconfirm
-cd ..
+    polkit-kde-agent qt5-wayland qt6-wayland \
+    sddm rofi-wayland swww dunst waybar
 
 # Enable SDDM
 systemctl enable sddm
 
-# Install Caelestia Scripts and Shell
-log "Installing Caelestia Shell..."
-cd /home/$USERNAME
-sudo -u $USERNAME git clone https://github.com/caelestia-dots/scripts.git caelestia-scripts
-cd caelestia-scripts
-sudo -u $USERNAME chmod +x install.sh
-sudo -u $USERNAME ./install.sh
-
-# Install Caelestia Shell dotfiles
-sudo -u $USERNAME mkdir -p /home/$USERNAME/.config/quickshell
-cd /home/$USERNAME/.config/quickshell
-sudo -u $USERNAME git clone https://github.com/caelestia-dots/shell.git caelestia
-
-# Create Hyprland config for Caelestia
+# Create basic Hyprland config
 sudo -u $USERNAME mkdir -p /home/$USERNAME/.config/hypr
 sudo -u $USERNAME tee /home/$USERNAME/.config/hypr/hyprland.conf > /dev/null <<EOF
-# Caelestia Hyprland Configuration
+# Hyprland Configuration
 monitor=,preferred,auto,auto
 
 # Autostart
-exec-once = quickshell -c caelestia
+exec-once = waybar
 exec-once = /usr/lib/polkit-kde-authentication-agent-1
 exec-once = swww-daemon
 exec-once = dunst
@@ -316,16 +326,12 @@ decoration {
         enabled = true
         size = 6
         passes = 2
-        new_optimizations = true
-        xray = true
-        ignore_opacity = true
     }
     
     drop_shadow = true
     shadow_range = 20
     shadow_render_power = 3
     col.shadow = rgba(1a1a1aee)
-    col.shadow_inactive = rgba(1a1a1a77)
     
     active_opacity = 0.98
     inactive_opacity = 0.85
@@ -354,16 +360,12 @@ animations {
 dwindle {
     pseudotile = true
     preserve_split = true
-    smart_split = false
-    smart_resizing = false
 }
 
 # Window rules
 windowrule = float, ^(pavucontrol)$
 windowrule = float, ^(blueman-manager)$
 windowrule = float, ^(nm-connection-editor)$
-windowrule = float, ^(firefox)$ # for popups
-windowrulev2 = float,class:^(firefox)$,title:^(Picture-in-Picture)$
 
 # Keybindings
 \$mainMod = SUPER
@@ -429,39 +431,255 @@ bindm = \$mainMod, mouse:272, movewindow
 bindm = \$mainMod, mouse:273, resizewindow
 EOF
 
+# Create basic waybar config
+sudo -u $USERNAME mkdir -p /home/$USERNAME/.config/waybar
+sudo -u $USERNAME tee /home/$USERNAME/.config/waybar/config > /dev/null <<EOF
+{
+    "layer": "top",
+    "position": "top",
+    "height": 30,
+    "spacing": 4,
+    
+    "modules-left": ["hyprland/workspaces"],
+    "modules-center": ["hyprland/window"],
+    "modules-right": ["pulseaudio", "network", "cpu", "memory", "temperature", "battery", "clock", "tray"],
+    
+    "hyprland/workspaces": {
+        "disable-scroll": true,
+        "all-outputs": true,
+        "format": "{name}: {icon}",
+        "format-icons": {
+            "1": "",
+            "2": "",
+            "3": "",
+            "4": "",
+            "5": "",
+            "urgent": "",
+            "focused": "",
+            "default": ""
+        }
+    },
+    
+    "clock": {
+        "tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>",
+        "format-alt": "{:%Y-%m-%d}"
+    },
+    
+    "cpu": {
+        "format": "{usage}% ",
+        "tooltip": false
+    },
+    
+    "memory": {
+        "format": "{}% "
+    },
+    
+    "temperature": {
+        "critical-threshold": 80,
+        "format": "{temperatureC}°C {icon}",
+        "format-icons": ["", "", ""]
+    },
+    
+    "battery": {
+        "states": {
+            "warning": 30,
+            "critical": 15
+        },
+        "format": "{capacity}% {icon}",
+        "format-charging": "{capacity}% ",
+        "format-plugged": "{capacity}% ",
+        "format-alt": "{time} {icon}",
+        "format-icons": ["", "", "", "", ""]
+    },
+    
+    "network": {
+        "format-wifi": "{essid} ({signalStrength}%) ",
+        "format-ethernet": "{ipaddr}/{cidr} ",
+        "tooltip-format": "{ifname} via {gwaddr} ",
+        "format-linked": "{ifname} (No IP) ",
+        "format-disconnected": "Disconnected ⚠",
+        "format-alt": "{ifname}: {ipaddr}/{cidr}"
+    },
+    
+    "pulseaudio": {
+        "format": "{volume}% {icon} {format_source}",
+        "format-bluetooth": "{volume}% {icon} {format_source}",
+        "format-bluetooth-muted": " {icon} {format_source}",
+        "format-muted": " {format_source}",
+        "format-source": "{volume}% ",
+        "format-source-muted": "",
+        "format-icons": {
+            "headphone": "",
+            "hands-free": "",
+            "headset": "",
+            "phone": "",
+            "portable": "",
+            "car": "",
+            "default": ["", "", ""]
+        },
+        "on-click": "pavucontrol"
+    }
+}
+EOF
+
+# Create waybar style
+sudo -u $USERNAME tee /home/$USERNAME/.config/waybar/style.css > /dev/null <<EOF
+* {
+    border: none;
+    border-radius: 0;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13px;
+    min-height: 0;
+}
+
+window#waybar {
+    background-color: rgba(43, 48, 59, 0.9);
+    border-bottom: 3px solid rgba(100, 114, 125, 0.5);
+    color: #ffffff;
+    transition-property: background-color;
+    transition-duration: .5s;
+}
+
+button {
+    box-shadow: inset 0 -3px transparent;
+    border: none;
+    border-radius: 0;
+}
+
+#workspaces button {
+    padding: 0 5px;
+    background-color: transparent;
+    color: #ffffff;
+}
+
+#workspaces button:hover {
+    background: rgba(0, 0, 0, 0.2);
+}
+
+#workspaces button.focused {
+    background-color: #64727D;
+    box-shadow: inset 0 -3px #ffffff;
+}
+
+#workspaces button.urgent {
+    background-color: #eb4d4b;
+}
+
+#clock,
+#battery,
+#cpu,
+#memory,
+#temperature,
+#network,
+#pulseaudio,
+#tray {
+    padding: 0 10px;
+    color: #ffffff;
+}
+
+#window {
+    margin: 0 4px;
+}
+
+#battery.charging, #battery.plugged {
+    color: #ffffff;
+    background-color: #26A65B;
+}
+
+#battery.critical:not(.charging) {
+    background-color: #f53c3c;
+    color: #ffffff;
+    animation-name: blink;
+    animation-duration: 0.5s;
+    animation-timing-function: linear;
+    animation-iteration-count: infinite;
+    animation-direction: alternate;
+}
+
+@keyframes blink {
+    to {
+        background-color: #ffffff;
+        color: #000000;
+    }
+}
+EOF
+
 # Set up wallpaper directory
 sudo -u $USERNAME mkdir -p /home/$USERNAME/Pictures/Wallpapers
 
-# Create a simple startup script for the user
-sudo -u $USERNAME tee /home/$USERNAME/.config/hypr/autostart.sh > /dev/null <<EOF
-#!/bin/bash
-# Set a default wallpaper if available
-if command -v caelestia &> /dev/null; then
-    caelestia wallpaper --random 2>/dev/null || swww img /usr/share/pixmaps/archlinux-logo.png 2>/dev/null || true
-else
-    swww img /usr/share/pixmaps/archlinux-logo.png 2>/dev/null || true
-fi
-EOF
-sudo -u $USERNAME chmod +x /home/$USERNAME/.config/hypr/autostart.sh
-
-echo "Caelestia Shell installation completed!"
+echo "Hyprland desktop environment installation completed!"
 HYPRLAND_SCRIPT
 
 sudo arch-chroot /mnt bash /install_hyprland.sh
 sudo rm /mnt/install_hyprland.sh
 
-# Step 11: Install rEFInd (optional)
-if confirm "Do you want to install rEFInd boot manager for a prettier boot menu?"; then
-    log "Installing rEFInd..."
-    sudo tee /mnt/install_refind.sh > /dev/null <<REFIND_SCRIPT
-#!/bin/bash
-pacman -S --noconfirm refind
-refind-install
-REFIND_SCRIPT
-    
-    sudo arch-chroot /mnt bash /install_refind.sh
-    sudo rm /mnt/install_refind.sh
-fi
+# Step 11: Create post-installation instructions
+log "Creating post-installation instructions..."
+sudo tee /mnt/home/$USERNAME/README_DUAL_BOOT.txt > /dev/null <<README
+=====================================
+DUAL BOOT SETUP INSTRUCTIONS
+=====================================
+
+Your Arch Linux installation is complete! Here's how to add Windows:
+
+STEP 1: Install Windows
+-----------------------
+1. Boot from Windows installation media
+2. When selecting where to install Windows, choose the unallocated space
+3. Windows will automatically create its own partitions in the free space
+4. Complete Windows installation normally
+
+STEP 2: Fix Boot After Windows Installation
+-------------------------------------------
+Windows will overwrite the boot loader. To fix this:
+
+1. Boot back into Arch Linux using the installation media
+2. Mount your Linux partitions:
+   sudo mount $ROOT_PART /mnt
+   sudo mount $EFI_PART /mnt/boot/efi
+   sudo mount $HOME_PART /mnt/home
+
+3. Reinstall GRUB:
+   sudo arch-chroot /mnt
+   grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ARCH --recheck
+   grub-mkconfig -o /boot/grub/grub.cfg
+   exit
+
+4. Reboot - you should now see both Arch Linux and Windows in GRUB
+
+STEP 3: Update GRUB After Windows Installation
+----------------------------------------------
+After installing Windows, run this command in Arch Linux:
+sudo grub-mkconfig -o /boot/grub/grub.cfg
+
+This will detect Windows and add it to the boot menu.
+
+CURRENT PARTITION LAYOUT:
+-------------------------
+EFI:  $EFI_PART (512MB) - Shared by both OS
+Root: $ROOT_PART ($ROOT_SIZE) - Arch Linux system
+Home: $HOME_PART ($HOME_SIZE) - Your files
+Swap: $SWAP_PART (4GB) - Virtual memory
+Free space: Available for Windows
+
+USEFUL COMMANDS:
+----------------
+- Start Hyprland: Type 'Hyprland' after logging in
+- Super+Q: Terminal
+- Super+W: Firefox
+- Super+R: Application launcher
+- Super+E: File manager
+
+TIPS:
+-----
+- Windows will be able to read your Linux home partition if you install ntfs-3g
+- Keep your files in the home partition to access them from both systems
+- Always update GRUB after Windows updates: sudo grub-mkconfig -o /boot/grub/grub.cfg
+
+Enjoy your dual boot setup!
+README
+
+sudo chown $USERNAME:$USERNAME /mnt/home/$USERNAME/README_DUAL_BOOT.txt
 
 # Step 12: Cleanup and finish
 log "Cleaning up..."
@@ -469,35 +687,36 @@ sudo umount -R /mnt
 sudo swapoff "$SWAP_PART"
 
 echo
-echo -e "${GREEN}================================${NC}"
-echo -e "${GREEN} Installation completed!${NC}"
-echo -e "${GREEN}================================${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN} Installation completed successfully!${NC}"
+echo -e "${GREEN}========================================${NC}"
 echo
 log "System Summary:"
 echo "  • Hostname: $HOSTNAME"
 echo "  • Username: $USERNAME"
-echo "  • Root partition: $ROOT_PART"
-echo "  • Swap partition: $SWAP_PART"
-echo "  • EFI partition: $EFI_PART"
+echo "  • EFI partition: $EFI_PART (512MB)"
+echo "  • Root partition: $ROOT_PART ($ROOT_SIZE)"
+echo "  • Home partition: $HOME_PART ($HOME_SIZE)"
+echo "  • Swap partition: $SWAP_PART (4GB)"
+echo "  • Free space: Available for Windows"
 echo
 log "Next steps:"
-echo "  1. Remove the installation media"
-echo "  2. Reboot your system"
-echo "  3. Select Arch Linux from the boot menu"
-echo "  4. Log in with your username and password"
-echo "  5. Start Hyprland with: Hyprland"
-echo "  6. Enjoy the beautiful Caelestia Shell!"
+echo "  1. Remove the installation media and reboot"
+echo "  2. Boot into your new Arch Linux system"
+echo "  3. Install Windows in the free space (see README_DUAL_BOOT.txt)"
+echo "  4. Fix GRUB after Windows installation"
 echo
-warn "First-time setup tips:"
-echo "  • Use 'caelestia wallpaper' to set wallpapers"
-echo "  • Super+R for app launcher (rofi)"
-echo "  • Super+Q for terminal, Super+W for Firefox"
-echo "  • The Quickshell widgets provide a gorgeous interface!"
+log "After first boot:"
+echo "  • Log in with your username and password"
+echo "  • Type 'Hyprland' to start the desktop environment"
+echo "  • Read ~/README_DUAL_BOOT.txt for dual boot instructions"
+echo "  • Update system: sudo pacman -Syu"
 echo
-warn "Remember to update your system after first boot:"
-echo "  sudo pacman -Syu"
+warn "Remember:"
+echo "  • The free space is reserved for Windows"
+echo "  • Windows will overwrite GRUB - follow the README to fix it"
+echo "  • Keep the Arch Linux installation media for GRUB recovery"
 echo
-log "Enjoy your new Arch Linux + Hyprland setup!"
 
 if confirm "Reboot now?"; then
     sudo reboot
